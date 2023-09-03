@@ -36,18 +36,20 @@
 #define REG_DETECTION_THRESHOLD  0x37
 #define REG_SYNC_WORD            0x39
 #define REG_INVERTIQ2            0x3b
+#define REG_IMAGECAL             0x3b // Modified
+#define REG_TEMP                 0x3c // Modified
 #define REG_DIO_MAPPING_1        0x40
 #define REG_VERSION              0x42
 #define REG_PA_DAC               0x4d
 
 // modes
 #define MODE_LONG_RANGE_MODE     0x80
+#define MODE_FSK_MODE            0x00 // Modified
 #define MODE_SLEEP               0x00
 #define MODE_STDBY               0x01
 #define MODE_TX                  0x03
 #define MODE_RX_CONTINUOUS       0x05
 #define MODE_RX_SINGLE           0x06
-#define MODE_CAD                 0x07
 
 // PA config
 #define PA_BOOST                 0x80
@@ -56,8 +58,6 @@
 #define IRQ_TX_DONE_MASK           0x08
 #define IRQ_PAYLOAD_CRC_ERROR_MASK 0x20
 #define IRQ_RX_DONE_MASK           0x40
-#define IRQ_CAD_DONE_MASK          0x04
-#define IRQ_CAD_DETECTED_MASK      0x01
 
 #define RF_MID_BAND_THRESHOLD    525E6
 #define RSSI_OFFSET_HF_PORT      157
@@ -79,7 +79,6 @@ LoRaClass::LoRaClass() :
   _packetIndex(0),
   _implicitHeaderMode(0),
   _onReceive(NULL),
-  _onCadDone(NULL),
   _onTxDone(NULL)
 {
   // overide Stream timeout value
@@ -278,20 +277,43 @@ float LoRaClass::packetSnr()
 long LoRaClass::packetFrequencyError()
 {
   int32_t freqError = 0;
-  freqError = static_cast<int32_t>(readRegister(REG_FREQ_ERROR_MSB) & 0b111);
+  freqError = static_cast<int32_t>(readRegister(REG_FREQ_ERROR_MSB) & B111);
   freqError <<= 8L;
   freqError += static_cast<int32_t>(readRegister(REG_FREQ_ERROR_MID));
   freqError <<= 8L;
   freqError += static_cast<int32_t>(readRegister(REG_FREQ_ERROR_LSB));
 
-  if (readRegister(REG_FREQ_ERROR_MSB) & 0b1000) { // Sign bit is on
-     freqError -= 524288; // 0b1000'0000'0000'0000'0000
+  if (readRegister(REG_FREQ_ERROR_MSB) & B1000) { // Sign bit is on
+     freqError -= 524288; // B1000'0000'0000'0000'0000
   }
 
   const float fXtal = 32E6; // FXOSC: crystal oscillator (XTAL) frequency (2.5. Chip Specification, p. 14)
   const float fError = ((static_cast<float>(freqError) * (1L << 24)) / fXtal) * (getSignalBandwidth() / 500000.0f); // p. 37
 
   return static_cast<long>(fError);
+}
+
+// Modified
+int LoRaClass::temperature() {
+    uint8_t opModeState = readRegister(REG_OP_MODE);
+    sleep();                                                        //must be in sleep mode in order to switch between FSK and long range mode
+    writeRegister(REG_OP_MODE, MODE_FSK_MODE | MODE_SLEEP);         //must be in FSK/OOK mode in order to access temp / imgage cal registers
+    writeRegister(REG_OP_MODE, MODE_FSK_MODE | MODE_RX_CONTINUOUS); //Temperature monitoring done in all modes except Sleep and Standby
+
+    uint8_t imgCalState = readRegister(REG_IMAGECAL);
+    writeRegister(REG_IMAGECAL,imgCalState &!0x01);                 //enable temperature reading
+    delayMicroseconds(140);
+    writeRegister(REG_IMAGECAL,imgCalState | 0x01);                 //stop temperature reading
+    uint8_t rawTemp = readRegister(REG_TEMP);
+
+    sleep();                                                        //restore REG_OP_MODE trough sleep
+    writeRegister(REG_OP_MODE, opModeState);
+
+    if((rawTemp&0x80)==0x80){                                       //datasheet unclear, int8_t would make more sense but this was example code
+        return(0xff - rawTemp);
+    }
+    return(-rawTemp);
+
 }
 
 int LoRaClass::rssi()
@@ -381,24 +403,6 @@ void LoRaClass::onReceive(void(*callback)(int))
   }
 }
 
-void LoRaClass::onCadDone(void(*callback)(boolean))
-{
-  _onCadDone = callback;
-
-  if (callback) {
-    pinMode(_dio0, INPUT);
-#ifdef SPI_HAS_NOTUSINGINTERRUPT
-    SPI.usingInterrupt(digitalPinToInterrupt(_dio0));
-#endif
-    attachInterrupt(digitalPinToInterrupt(_dio0), LoRaClass::onDio0Rise, RISING);
-  } else {
-    detachInterrupt(digitalPinToInterrupt(_dio0));
-#ifdef SPI_HAS_NOTUSINGINTERRUPT
-    SPI.notUsingInterrupt(digitalPinToInterrupt(_dio0));
-#endif
-  }
-}
-
 void LoRaClass::onTxDone(void(*callback)())
 {
   _onTxDone = callback;
@@ -431,12 +435,6 @@ void LoRaClass::receive(int size)
   }
 
   writeRegister(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_RX_CONTINUOUS);
-}
-
-void LoRaClass::channelActivityDetection(void)
-{
-  writeRegister(REG_DIO_MAPPING_1, 0x80);// DIO0 => CADDONE
-  writeRegister(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_CAD);
 }
 #endif
 
@@ -724,11 +722,7 @@ void LoRaClass::handleDio0Rise()
   // clear IRQ's
   writeRegister(REG_IRQ_FLAGS, irqFlags);
 
-  if ((irqFlags & IRQ_CAD_DONE_MASK) != 0) {
-    if (_onCadDone) {
-      _onCadDone((irqFlags & IRQ_CAD_DETECTED_MASK) != 0);
-    }
-  } else if ((irqFlags & IRQ_PAYLOAD_CRC_ERROR_MASK) == 0) {
+  if ((irqFlags & IRQ_PAYLOAD_CRC_ERROR_MASK) == 0) {
 
     if ((irqFlags & IRQ_RX_DONE_MASK) != 0) {
       // received a packet
@@ -743,7 +737,8 @@ void LoRaClass::handleDio0Rise()
       if (_onReceive) {
         _onReceive(packetLength);
       }
-    } else if ((irqFlags & IRQ_TX_DONE_MASK) != 0) {
+    }
+    else if ((irqFlags & IRQ_TX_DONE_MASK) != 0) {
       if (_onTxDone) {
         _onTxDone();
       }
@@ -765,12 +760,14 @@ uint8_t LoRaClass::singleTransfer(uint8_t address, uint8_t value)
 {
   uint8_t response;
 
-  _spi->beginTransaction(_spiSettings);
   digitalWrite(_ss, LOW);
+
+  _spi->beginTransaction(_spiSettings);
   _spi->transfer(address);
   response = _spi->transfer(value);
-  digitalWrite(_ss, HIGH);
   _spi->endTransaction();
+
+  digitalWrite(_ss, HIGH);
 
   return response;
 }
